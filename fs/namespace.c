@@ -34,6 +34,8 @@
 #include "pnode.h"
 #include "internal.h"
 
+#include <trace/hooks/secureguard.h>
+
 /* Maximum number of mounts in a mount namespace */
 unsigned int sysctl_mount_max __read_mostly = 100000;
 
@@ -1669,8 +1671,12 @@ static inline bool may_mount(void)
 }
 
 #ifdef	CONFIG_MANDATORY_FILE_LOCKING
-static inline bool may_mandlock(void)
+static bool may_mandlock(void)
 {
+	pr_warn_once("======================================================\n"
+		     "WARNING: the mand mount option is being deprecated and\n"
+		     "         will be removed in v5.15!\n"
+		     "======================================================\n");
 	return capable(CAP_SYS_ADMIN);
 }
 #else
@@ -1883,6 +1889,20 @@ void drop_collected_mounts(struct vfsmount *mnt)
 	namespace_unlock();
 }
 
+static bool has_locked_children(struct mount *mnt, struct dentry *dentry)
+{
+	struct mount *child;
+
+	list_for_each_entry(child, &mnt->mnt_mounts, mnt_child) {
+		if (!is_subdir(child->mnt_mountpoint, dentry))
+			continue;
+
+		if (child->mnt.mnt_flags & MNT_LOCKED)
+			return true;
+	}
+	return false;
+}
+
 /**
  * clone_private_mount - create a private clone of a path
  *
@@ -1897,14 +1917,27 @@ struct vfsmount *clone_private_mount(const struct path *path)
 	struct mount *old_mnt = real_mount(path->mnt);
 	struct mount *new_mnt;
 
+	down_read(&namespace_sem);
 	if (IS_MNT_UNBINDABLE(old_mnt))
-		return ERR_PTR(-EINVAL);
+		goto invalid;
+
+	if (!check_mnt(old_mnt))
+		goto invalid;
+
+	if (has_locked_children(old_mnt, path->dentry))
+		goto invalid;
 
 	new_mnt = clone_mnt(old_mnt, path->dentry, CL_PRIVATE);
+	up_read(&namespace_sem);
+
 	if (IS_ERR(new_mnt))
 		return ERR_CAST(new_mnt);
 
 	return &new_mnt->mnt;
+
+invalid:
+	up_read(&namespace_sem);
+	return ERR_PTR(-EINVAL);
 }
 EXPORT_SYMBOL_GPL(clone_private_mount);
 
@@ -2254,19 +2287,6 @@ static int do_change_type(struct path *path, int ms_flags)
  out_unlock:
 	namespace_unlock();
 	return err;
-}
-
-static bool has_locked_children(struct mount *mnt, struct dentry *dentry)
-{
-	struct mount *child;
-	list_for_each_entry(child, &mnt->mnt_mounts, mnt_child) {
-		if (!is_subdir(child->mnt_mountpoint, dentry))
-			continue;
-
-		if (child->mnt.mnt_flags & MNT_LOCKED)
-			return true;
-	}
-	return false;
 }
 
 static struct mount *__do_loopback(struct path *old_path, int recurse)
@@ -3076,6 +3096,9 @@ char *copy_mount_string(const void __user *data)
 {
 	return data ? strndup_user(data, PATH_MAX) : NULL;
 }
+#ifdef CONFIG_OPLUS_KERNEL_SECURE_GUARD
+extern int oplus_mount_block(const char __user *dir_name, unsigned long flags);
+#endif /* CONFIG_OPLUS_KERNEL_SECURE_GUARD */
 
 /*
  * Flags is a 32-bit value that allows up to 31 non-fs dependent flags to
@@ -3098,6 +3121,12 @@ long do_mount(const char *dev_name, const char __user *dir_name,
 	unsigned int mnt_flags = 0, sb_flags;
 	int retval = 0;
 
+#ifdef CONFIG_OPLUS_KERNEL_SECURE_GUARD
+	retval = oplus_mount_block(dir_name, flags);
+	if (retval < 0){
+		return -EPERM;
+	}
+#endif /* CONFIG_OPLUS_KERNEL_SECURE_GUARD */
 	/* Discard magic */
 	if ((flags & MS_MGC_MSK) == MS_MGC_VAL)
 		flags &= ~MS_MGC_MSK;

@@ -287,6 +287,7 @@ void dwc3_ep0_out_start(struct dwc3 *dwc)
 {
 	struct dwc3_ep			*dep;
 	int				ret;
+	int 				i;
 
 	complete(&dwc->ep0_in_setup);
 
@@ -299,6 +300,23 @@ void dwc3_ep0_out_start(struct dwc3 *dwc)
 	ret = dwc3_ep0_start_trans(dep);
 	if (WARN_ON(ret < 0))
 		dbg_event(dwc->eps[0]->number, "EOUTSTART", ret);
+
+	for (i = 2; i < DWC3_ENDPOINTS_NUM; i++) {
+		struct dwc3_ep *dwc3_ep;
+
+		dwc3_ep = dwc->eps[i];
+		if (!dwc3_ep)
+			continue;
+
+		if (!(dwc3_ep->flags & DWC3_EP_DELAY_STOP))
+			continue;
+
+		dwc3_ep->flags &= ~DWC3_EP_DELAY_STOP;
+		if (dwc->connected)
+			dwc3_stop_active_transfer(dwc3_ep, true, true);
+		else
+			dwc3_remove_requests(dwc, dwc3_ep);
+	}
 }
 
 static struct dwc3_ep *dwc3_wIndex_to_dep(struct dwc3 *dwc, __le16 wIndex_le)
@@ -391,6 +409,9 @@ static int dwc3_ep0_handle_status(struct dwc3 *dwc,
 	dwc->ep0_usb_req.request.length = sizeof(*response_pkt);
 	dwc->ep0_usb_req.request.buf = dwc->setup_buf;
 	dwc->ep0_usb_req.request.complete = dwc3_ep0_status_cmpl;
+#ifdef CONFIG_OPLUS_FEATURE_CHG_MISC
+	dwc->ep0_usb_req.request.dma = DMA_ERROR_CODE;
+#endif
 
 	return __dwc3_gadget_ep0_queue(dep, &dwc->ep0_usb_req);
 }
@@ -800,6 +821,9 @@ static int dwc3_ep0_set_sel(struct dwc3 *dwc, struct usb_ctrlrequest *ctrl)
 	dwc->ep0_usb_req.request.length = dep->endpoint.maxpacket;
 	dwc->ep0_usb_req.request.buf = dwc->setup_buf;
 	dwc->ep0_usb_req.request.complete = dwc3_ep0_set_sel_cmpl;
+#ifdef CONFIG_OPLUS_FEATURE_CHG_MISC
+	dwc->ep0_usb_req.request.dma = DMA_ERROR_CODE;
+#endif
 
 	return __dwc3_gadget_ep0_queue(dep, &dwc->ep0_usb_req);
 }
@@ -1149,6 +1173,7 @@ void dwc3_ep0_send_delayed_status(struct dwc3 *dwc)
 	unsigned int direction = !dwc->ep0_expect_in;
 
 	dwc->delayed_status = false;
+	dwc->clear_stall_protocol = 0;
 
 	if (dwc->ep0state != EP0_STATUS_PHASE)
 		return;

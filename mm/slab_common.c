@@ -329,14 +329,6 @@ int slab_unmergeable(struct kmem_cache *s)
 	if (s->refcount < 0)
 		return 1;
 
-#ifdef CONFIG_MEMCG_KMEM
-	/*
-	 * Skip the dying kmem_cache.
-	 */
-	if (s->memcg_params.dying)
-		return 1;
-#endif
-
 	return 0;
 }
 
@@ -977,6 +969,16 @@ void kmem_cache_destroy(struct kmem_cache *s)
 	get_online_mems();
 
 	mutex_lock(&slab_mutex);
+
+	/*
+	 * Another thread referenced it again
+	 */
+	if (READ_ONCE(s->refcount)) {
+		spin_lock_irq(&memcg_kmem_wq_lock);
+		s->memcg_params.dying = false;
+		spin_unlock_irq(&memcg_kmem_wq_lock);
+		goto out_unlock;
+	}
 #endif
 
 	err = shutdown_memcg_caches(s);
@@ -1173,6 +1175,16 @@ struct kmem_cache *kmalloc_slab(size_t size, gfp_t flags)
 		index = fls(size - 1);
 	}
 
+#if defined(OPLUS_FEATURE_MEMLEAK_DETECT) && defined(CONFIG_KMALLOC_DEBUG)
+	/* try to kmalloc from kmalloc_debug caches fisrt */
+	if (unlikely(kmalloc_debug_enable)) {
+		struct kmem_cache *s;
+
+		s = (struct kmem_cache *)atomic64_read(&kmalloc_debug_caches[kmalloc_type(flags)][index]);
+		if (unlikely(s))
+			return s;
+	}
+#endif
 	return kmalloc_caches[kmalloc_type(flags)][index];
 }
 
@@ -1275,8 +1287,13 @@ new_kmalloc_cache(int idx, int type, slab_flags_t flags)
 	}
 
 	kmalloc_caches[type][idx] = create_kmalloc_cache(name,
-					kmalloc_info[idx].size, flags, 0,
-					kmalloc_info[idx].size);
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_SLABTRACE_DEBUG)
+		kmalloc_info[idx].size, flags | SLAB_STORE_USER, 0,
+#else
+		kmalloc_info[idx].size, flags, 0,
+#endif
+		kmalloc_info[idx].size);
 }
 
 /*
@@ -1433,6 +1450,10 @@ static void print_slabinfo_header(struct seq_file *m)
 	seq_puts(m, " : globalstat <listallocs> <maxobjs> <grown> <reaped> <error> <maxfreeable> <nodeallocs> <remotefrees> <alienoverflow>");
 	seq_puts(m, " : cpustat <allochit> <allocmiss> <freehit> <freemiss>");
 #endif
+#if defined OPLUS_FEATURE_HEALTHINFO && defined CONFIG_OPLUS_HEALTHINFO
+	seq_puts(m, " <reclaim>");
+
+#endif /* OPLUS_FEATURE_HEALTHINFO */
 	seq_putc(m, '\n');
 }
 
@@ -1488,8 +1509,14 @@ static void cache_show(struct kmem_cache *s, struct seq_file *m)
 
 	seq_printf(m, " : tunables %4u %4u %4u",
 		   sinfo.limit, sinfo.batchcount, sinfo.shared);
+#if (!defined OPLUS_FEATURE_HEALTHINFO) || (!defined CONFIG_OPLUS_HEALTHINFO)
 	seq_printf(m, " : slabdata %6lu %6lu %6lu",
 		   sinfo.active_slabs, sinfo.num_slabs, sinfo.shared_avail);
+#else /* OPLUS_FEATURE_HEALTHINFO */
+	seq_printf(m, " : slabdata %6lu %6lu %6lu %1d",
+			   sinfo.active_slabs, sinfo.num_slabs, sinfo.shared_avail,
+			   ((s->flags & SLAB_RECLAIM_ACCOUNT) == SLAB_RECLAIM_ACCOUNT) ? 1: 0);
+#endif /* OPLUS_FEATURE_HEALTHINFO */
 	slabinfo_show_stats(m, s);
 	seq_putc(m, '\n');
 }

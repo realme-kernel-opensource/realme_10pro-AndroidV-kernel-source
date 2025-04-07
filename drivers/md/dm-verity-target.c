@@ -15,7 +15,9 @@
 
 #include "dm-verity.h"
 #include "dm-verity-fec.h"
+#include <linux/delay.h>
 #include "dm-verity-verify-sig.h"
+#include <linux/init.h>
 #include <linux/module.h>
 #include <linux/reboot.h>
 
@@ -33,12 +35,24 @@
 #define DM_VERITY_OPT_IGN_ZEROES	"ignore_zero_blocks"
 #define DM_VERITY_OPT_AT_MOST_ONCE	"check_at_most_once"
 
-#define DM_VERITY_OPTS_MAX		(3 + DM_VERITY_OPTS_FEC + \
+#define DM_VERITY_OPTS_MAX		(4 + DM_VERITY_OPTS_FEC + \
 					 DM_VERITY_ROOT_HASH_VERIFICATION_OPTS)
 
 static unsigned dm_verity_prefetch_cluster = DM_VERITY_DEFAULT_PREFETCH_SIZE;
 
 module_param_named(prefetch_cluster, dm_verity_prefetch_cluster, uint, S_IRUGO | S_IWUSR);
+
+/*
+ * If rootwait parameter defined, wait for root device to be available
+ * before continuing with verity target
+ */
+static int dm_device_wait;
+static int __init dm_verity_root_wait_setup(char *s)
+{
+	dm_device_wait = 1;
+	return 0;
+}
+early_param("rootwait", dm_verity_root_wait_setup);
 
 struct dm_verity_prefetch_work {
 	struct work_struct work;
@@ -263,7 +277,13 @@ out:
 #ifdef CONFIG_DM_VERITY_AVB
 		dm_verity_avb_error_handler();
 #endif
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_FEEDBACK)
+		panic("dm-verity device corrupted");
+#else
 		kernel_restart("dm-verity device corrupted");
+#endif /* CONFIG_OPLUS_FEATURE_FEEDBACK */
+
 	}
 
 	return 1;
@@ -490,7 +510,7 @@ static int verity_verify_io(struct dm_verity_io *io)
 		sector_t cur_block = io->block + b;
 		struct ahash_request *req = verity_io_hash_req(v, io);
 
-		if (v->validated_blocks &&
+		if (v->validated_blocks && bio->bi_status == BLK_STS_OK &&
 		    likely(test_bit(cur_block, v->validated_blocks))) {
 			verity_bv_skip_block(v, io, &io->iter);
 			continue;
@@ -546,7 +566,7 @@ static int verity_verify_io(struct dm_verity_io *io)
 				return -EIO;
 			}
 			if (verity_handle_err(v, DM_VERITY_BLOCK_TYPE_DATA,
-					   cur_block))
+					      cur_block))
 				return -EIO;
 		}
 	}
@@ -934,6 +954,7 @@ static int verity_parse_opt_args(struct dm_arg_set *as, struct dm_verity *v,
 			if (r)
 				return r;
 			continue;
+
 		} else if (verity_verify_is_sig_opt_arg(arg_name)) {
 			r = verity_verify_sig_parse_opt_args(as, v,
 							     verify_args,
@@ -1010,14 +1031,25 @@ static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 	v->version = num;
 
+retry_dev1:
+
 	r = dm_get_device(ti, argv[1], FMODE_READ, &v->data_dev);
 	if (r) {
+		if (r == -ENODEV && dm_device_wait) {
+			msleep(100);
+			goto retry_dev1;
+		}
 		ti->error = "Data device lookup failed";
 		goto bad;
 	}
 
+retry_dev2:
 	r = dm_get_device(ti, argv[2], FMODE_READ, &v->hash_dev);
 	if (r) {
+		if (r == -ENODEV && dm_device_wait) {
+			msleep(100);
+			goto retry_dev2;
+		}
 		ti->error = "Hash device lookup failed";
 		goto bad;
 	}
@@ -1198,7 +1230,13 @@ static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 	/* WQ_UNBOUND greatly improves performance when running on ramdisk */
+
+#if defined(OPLUS_FEATURE_SCHED_ASSIST) && defined(CONFIG_OPLUS_FEATURE_SCHED_ASSIST)
+	v->verify_wq = alloc_workqueue("kverityd", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND | WQ_UX, num_online_cpus());
+#else
 	v->verify_wq = alloc_workqueue("kverityd", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
+#endif
+
 	if (!v->verify_wq) {
 		ti->error = "Cannot allocate workqueue";
 		r = -ENOMEM;
@@ -1229,6 +1267,7 @@ bad:
 
 static struct target_type verity_target = {
 	.name		= "verity",
+	.features	= DM_TARGET_IMMUTABLE,
 	.version	= {1, 5, 0},
 	.module		= THIS_MODULE,
 	.ctr		= verity_ctr,
